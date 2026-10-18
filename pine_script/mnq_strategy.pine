@@ -1,0 +1,165 @@
+
+ //@version=6
+strategy("MNQ Liquidity Void — Combined Volume + Drawdown Research",
+     overlay=true,
+     initial_capital=2500,
+     currency=currency.USD,
+     default_qty_type=strategy.fixed,
+     default_qty_value=2,
+     pyramiding=3,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=1.0,
+     slippage=1,
+     margin_long=0.5,
+     margin_short=0.5,
+     process_orders_on_close=false,
+     calc_on_order_fills=false)
+
+// =====================================================
+// RESEARCH CONTROLS
+// =====================================================
+useGapFilter = input.bool(true, "Use minimum Liquidity Void size")
+minGap       = input.float(30.0, "Minimum Liquidity Void size (points)", minval=0.0, step=2.5)
+
+entryStyle = input.string("Retracement Limit", "Entry style",
+     options=["Market", "Retracement Limit"])
+
+expiryBars = input.int(12, "Limit entry expiry (bars)", minval=1)
+
+initialQty = input.int(2, "Initial contracts", minval=1)
+addQty     = input.int(2, "Contracts per add", minval=1)
+
+useAdd1 = input.bool(true, "Enable first scale-in")
+useAdd2 = input.bool(true, "Enable second scale-in")
+
+stopPts = input.float(25.0, "Initial stop (points)", minval=1)
+add1Pts = input.float(15.0, "First add distance (points)", minval=1)
+add2Pts = input.float(25.0, "Second add distance (points)", minval=1)
+targetPts = input.float(60.0, "Target from original entry (points)", minval=1)
+
+moveToBreakeven = input.bool(true, "Move stop to entry after first add")
+
+tradeSession = input.session("0930-1600", "Trading session")
+inSession = not na(time(timeframe.period, tradeSession, "America/New_York"))
+
+// =====================================================
+// THREE-CANDLE LIQUIDITY VOIDS
+// =====================================================
+bullGap = low - high[2]
+bearGap = low[2] - high
+
+bullVoid = bar_index >= 2 and bullGap > 0 and
+     (not useGapFilter or bullGap >= minGap)
+
+bearVoid = bar_index >= 2 and bearGap > 0 and
+     (not useGapFilter or bearGap >= minGap)
+
+// Bullish gap boundaries: high[2] to low.
+// Bearish gap boundaries: high to low[2].
+longLimit  = high[2]
+shortLimit = low[2]
+
+// =====================================================
+// ENTRY STATE
+// =====================================================
+var int pendingSide = 0
+var int pendingBar  = na
+var float baseEntry = na
+var bool add1Filled = false
+
+flat = strategy.position_size == 0
+newLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+// Cancel unfilled entry limits after expiry or session end.
+if flat and pendingSide != 0
+    expired = not na(pendingBar) and bar_index - pendingBar >= expiryBars
+    if expired or not inSession
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+        pendingSide := 0
+        pendingBar := na
+
+// Submit a new entry only when flat and no entry is pending.
+if flat and pendingSide == 0 and inSession
+    if bullVoid
+        if entryStyle == "Market"
+            strategy.entry("Long", strategy.long, qty=initialQty)
+        else
+            strategy.entry("Long", strategy.long, qty=initialQty, limit=longLimit)
+            pendingSide := 1
+            pendingBar := bar_index
+
+    else if bearVoid
+        if entryStyle == "Market"
+            strategy.entry("Short", strategy.short, qty=initialQty)
+        else
+            strategy.entry("Short", strategy.short, qty=initialQty, limit=shortLimit)
+            pendingSide := -1
+            pendingBar := bar_index
+
+// Detect actual fills, then anchor management to the initial fill price.
+if newLong or newShort
+    baseEntry := strategy.position_avg_price
+    add1Filled := false
+    pendingSide := 0
+    pendingBar := na
+
+// Detect first scale-in fill from actual position size.
+if strategy.position_size > 0 and strategy.position_size >= initialQty + addQty
+    add1Filled := true
+
+if strategy.position_size < 0 and math.abs(strategy.position_size) >= initialQty + addQty
+    add1Filled := true
+
+// =====================================================
+// SCALE-INS — SECOND ADD ONLY AFTER FIRST ADD FILLS
+// =====================================================
+if strategy.position_size > 0 and not na(baseEntry)
+    if useAdd1 and not add1Filled
+        strategy.entry("Long Add 1", strategy.long, qty=addQty,
+             limit=baseEntry + add1Pts)
+
+    if useAdd2 and add1Filled
+        strategy.entry("Long Add 2", strategy.long, qty=addQty,
+             limit=baseEntry + add2Pts)
+
+if strategy.position_size < 0 and not na(baseEntry)
+    if useAdd1 and not add1Filled
+        strategy.entry("Short Add 1", strategy.short, qty=addQty,
+             limit=baseEntry - add1Pts)
+
+    if useAdd2 and add1Filled
+        strategy.entry("Short Add 2", strategy.short, qty=addQty,
+             limit=baseEntry - add2Pts)
+
+// =====================================================
+// STOPS AND TARGETS
+// =====================================================
+if strategy.position_size > 0 and not na(baseEntry)
+    longStop = moveToBreakeven and add1Filled ? baseEntry : baseEntry - stopPts
+    longTarget = baseEntry + targetPts
+
+    strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTarget)
+    strategy.exit("Long Add 1 Exit", from_entry="Long Add 1", stop=longStop, limit=longTarget)
+    strategy.exit("Long Add 2 Exit", from_entry="Long Add 2", stop=longStop, limit=longTarget)
+
+if strategy.position_size < 0 and not na(baseEntry)
+    shortStop = moveToBreakeven and add1Filled ? baseEntry : baseEntry + stopPts
+    shortTarget = baseEntry - targetPts
+
+    strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTarget)
+    strategy.exit("Short Add 1 Exit", from_entry="Short Add 1", stop=shortStop, limit=shortTarget)
+    strategy.exit("Short Add 2 Exit", from_entry="Short Add 2", stop=shortStop, limit=shortTarget)
+
+// Cancel leftover scale-in orders when flat.
+if flat
+    strategy.cancel("Long Add 1")
+    strategy.cancel("Long Add 2")
+    strategy.cancel("Short Add 1")
+    strategy.cancel("Short Add 2")
+    baseEntry := na
+    add1Filled := false
+
+plot(strategy.position_size != 0 ? baseEntry : na,
+     "Original Entry", color=color.yellow, linewidth=2, style=plot.style_linebr)
